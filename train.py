@@ -14,6 +14,8 @@ from common.evaluation import sample_generate, sample_generate_light, calc_incep
 from common.record import record_setting
 import common.net
 
+import chainermn
+
 def make_optimizer(model, alpha, beta1, beta2):
     optimizer = chainer.optimizers.Adam(alpha=alpha, beta1=beta1, beta2=beta2)
     optimizer.setup(model)
@@ -41,6 +43,11 @@ def main():
     args = parser.parse_args()
     record_setting(args.out)
     report_keys = ["loss_dis", "loss_gen", "inception_mean", "inception_std", "FID"]
+
+
+    # communicator
+    comm = chainermn.create_communicator('hierarchical')
+
 
     # Set up dataset
     train_dataset = Cifar10Dataset()
@@ -91,7 +98,7 @@ def main():
         from minibatch_discrimination.updater import Updater
         if args.architecture=="dcgan":
             generator = common.net.DCGANGenerator()
-            discriminator = Discriminator()
+            discriminator = Discriminator(comm)
         else:
             raise NotImplementedError()
         models = [generator, discriminator]
@@ -150,7 +157,7 @@ def main():
 
 
     if args.gpu >= 0:
-        chainer.cuda.get_device_from_id(args.gpu).use()
+        chainer.cuda.get_device_from_id(comm.rank).use()
         print("use gpu {}".format(args.gpu))
         for m in models:
             m.to_gpu()
@@ -163,25 +170,26 @@ def main():
     updater_args["models"] = models
 
     # Set up updater and trainer
-    updater = Updater(**updater_args)
+    updater = Updater(comm, **updater_args)
     trainer = training.Trainer(updater, (args.max_iter, 'iteration'), out=args.out)
 
     # Set up logging
-    for m in models:
-        trainer.extend(extensions.snapshot_object(
-            m, m.__class__.__name__ + '_{.updater.iteration}.npz'), trigger=(args.snapshot_interval, 'iteration'))
-    trainer.extend(extensions.LogReport(keys=report_keys,
-                                        trigger=(args.display_interval, 'iteration')))
-    trainer.extend(extensions.PrintReport(report_keys), trigger=(args.display_interval, 'iteration'))
-    trainer.extend(sample_generate(generator, args.out), trigger=(args.evaluation_interval, 'iteration'),
-                   priority=extension.PRIORITY_WRITER)
-    trainer.extend(sample_generate_light(generator, args.out), trigger=(args.evaluation_interval // 10, 'iteration'),
-                   priority=extension.PRIORITY_WRITER)
-    trainer.extend(calc_inception(generator), trigger=(args.evaluation_interval, 'iteration'),
-                   priority=extension.PRIORITY_WRITER)
-    trainer.extend(calc_FID(generator), trigger=(args.evaluation_interval, 'iteration'),
-                   priority=extension.PRIORITY_WRITER)
-    trainer.extend(extensions.ProgressBar(update_interval=10))
+    if comm.rank == 0:
+        for m in models:
+            trainer.extend(extensions.snapshot_object(
+                m, m.__class__.__name__ + '_{.updater.iteration}.npz'), trigger=(args.snapshot_interval, 'iteration'))
+        trainer.extend(extensions.LogReport(keys=report_keys,
+                                            trigger=(args.display_interval, 'iteration')))
+        trainer.extend(extensions.PrintReport(report_keys), trigger=(args.display_interval, 'iteration'))
+        trainer.extend(sample_generate(generator, args.out), trigger=(args.evaluation_interval, 'iteration'),
+                       priority=extension.PRIORITY_WRITER)
+        trainer.extend(sample_generate_light(generator, args.out), trigger=(args.evaluation_interval // 10, 'iteration'),
+                       priority=extension.PRIORITY_WRITER)
+        trainer.extend(calc_inception(generator), trigger=(args.evaluation_interval, 'iteration'),
+                       priority=extension.PRIORITY_WRITER)
+        trainer.extend(calc_FID(generator), trigger=(args.evaluation_interval, 'iteration'),
+                       priority=extension.PRIORITY_WRITER)
+        trainer.extend(extensions.ProgressBar(update_interval=10))
 
     # Run the training
     trainer.run()

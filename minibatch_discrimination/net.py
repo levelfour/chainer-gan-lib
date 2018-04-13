@@ -31,6 +31,8 @@ class Discriminator(chainer.Chain):
             self.bn3_0 = L.BatchNormalization(ch // 1, use_gamma=False)
 
     def __call__(self, x):
+        LOW_MEMORY_LEVEL = 1 # choose from {0: Normal, 1: Medium, 2: Massive}
+
         N = x.data.shape[0]
         h = F.leaky_relu(self.c0_0(x))
         h = F.leaky_relu(self.bn0_1(self.c0_1(h)))
@@ -41,7 +43,7 @@ class Discriminator(chainer.Chain):
         feature = F.reshape(F.leaky_relu(self.c3_0(h)), (N, 8192))
         m = F.reshape(self.md(feature), (N, self.B * self.C, 1))
 
-        # all to all
+        # all-to-all
         P = self.comm.size
         i = self.comm.rank
         m = F.broadcast_to(m, (N, self.B * self.C, P))
@@ -52,9 +54,32 @@ class Discriminator(chainer.Chain):
         m = F.transpose(m, (1, 2, 0))
 
         # minibatch discrimination
-        m0 = F.broadcast_to(m, (P*N, self.B * self.C, P*N))
-        m1 = F.transpose(m0[:, :, i*N:(i+1)*N], (2, 1, 0))
-        d = F.absolute(F.reshape(m0[i*N:(i+1)*N] - m1, (N, self.B, self.C, P*N)))
+        if LOW_MEMORY_LEVEL == 0:
+            # NOTE: this line consumes O(P^2) memory!!
+            m0 = F.broadcast_to(m, (P*N, self.B * self.C, P*N))
+            m1 = F.transpose(m0[:, :, i*N:(i+1)*N], (2, 1, 0))
+            d = m0[i*N:(i+1)*N] - m1
+
+        elif LOW_MEMORY_LEVEL == 1:
+            m = m[:, :, 0]          # PN*BC
+            m0 = m[i*N:(i+1)*N, :]  # N*BC
+            d = F.stack([
+                    F.broadcast_to(m0[j:j+1], (P*N, self.B * self.C)) - m
+                for j in range(N)])
+
+        elif LOW_MEMORY_LEVEL == 2:
+            m = m[:, :, 0]          # PN*BC
+            m0 = m[i*N:(i+1)*N, :]  # N*BC
+            # NOTE: this line is quite slow!!
+            # BC -(listcomp+stack)-> PN*BC -(listcomp+stack)-> N*PN*BC
+            d = F.stack([
+                    F.stack([m0[j] - m[k] for k in range(P*N)], axis=0)
+                for j in range(N)], axis=0)
+
+        else:
+            raise ValueError('LOW_MEMORY_MODE must be in {0, 1, 2}.')
+
+        d = F.absolute(F.reshape(d, (N, self.B, self.C, P*N)))
         d = F.sum(F.exp(-F.sum(d, axis=2)), axis=2) - 1
         h = F.concat([feature, d])
 

@@ -50,7 +50,11 @@ def main():
 
 
     # Set up dataset
-    train_dataset = Cifar10Dataset()
+    if comm.rank == 0:
+        train_dataset = Cifar10Dataset()
+    else:
+        train_dataset = None
+    train_dataset = chainermn.scatter_dataset(train_dataset, comm, shuffle=True)
     train_iter = chainer.iterators.SerialIterator(train_dataset, args.batchsize)
 
     # Setup algorithm specific networks and updaters
